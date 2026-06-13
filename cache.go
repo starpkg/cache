@@ -1,12 +1,26 @@
 // Package cache provides a Starlark module offering bounded, in-memory
 // key-value caches with TTL expiry.
 //
-// Each cache from new_cache() is an independent namespace. Stored values are
-// snapshotted through the serial module (a lossless dumps/loads round-trip), so
-// a cached value is an immutable, independent copy: mutating what you put in or
-// what you get out never affects the stored entry. Caches are bounded — once
-// max_entries is reached, the oldest entry is evicted. Only serializable values
-// can be cached (functions and the like are rejected by serial).
+// Design summary (the README's "Design & semantics" section is the long form):
+//
+//   - Namespacing: each new_cache() is an INDEPENDENT instance. There is no
+//     central Manager/registry — to separate namespaces, create separate caches.
+//   - Eviction is FIFO (oldest-inserted evicted first), NOT LRU. FIFO needs no
+//     per-access bookkeeping, so it is simple and predictable; the tradeoff is
+//     that a frequently read ("hot") key is not protected from eviction.
+//   - The bound is max_entries (default 128, host-configurable). Caches never
+//     hold more live entries than that.
+//   - Values are stored as an immutable serial snapshot (serial.dumps -> string
+//     on set, serial.loads -> fresh value on get), so a cached value is a
+//     lossless, independent copy: mutating what you put in, or what you get out,
+//     never affects the stored entry. Only serializable values can be cached;
+//     a non-serializable value makes set() return an error — there is no silent
+//     variant, and no path panics the host.
+//   - Concurrency: every operation is guarded by a sync.Mutex, so reads and
+//     writes are serializable and each call sees a consistent snapshot.
+//   - TTL expiry is lazy: an entry is purged on per-key access (get/has/delete)
+//     and on keys()/size() scans, never by a background goroutine. The clock is
+//     injectable via NewModuleWithClock for deterministic TTL testing.
 package cache
 
 import (
@@ -111,16 +125,37 @@ func (m *Module) newCache(thread *starlark.Thread, b *starlark.Builtin, args sta
 }
 
 // cacheEntry is one stored value: its serial-encoded form and optional expiry.
+//
+// data is an immutable serial snapshot of the cached Starlark value
+// (serial.dumps -> string at set time). On get it is decoded back with
+// serial.loads into a fresh, independent value, so neither the value the caller
+// stored nor any value the caller later reads can mutate the stored entry.
 type cacheEntry struct {
 	data      string
 	expiresAt time.Time // zero == no expiry
 }
 
 // cacheValue is a bounded, TTL-aware key-value store exposed to Starlark.
+//
+// Design (see package doc and README for the full rationale):
+//
+//   - Eviction is FIFO — the oldest *inserted* entry is evicted first when the
+//     store grows past maxEntries. This is deliberately NOT LRU: FIFO needs no
+//     per-access bookkeeping (a get never touches order), making it simple and
+//     predictable at the cost of not favouring hot keys. order holds the keys in
+//     insertion order; eviction pops from the front (order[0]).
+//   - The bound is maxEntries; the store never holds more live entries than that.
+//   - Values are stored as an immutable serial snapshot (string) and decoded into
+//     a fresh value on get, giving independent copies (see cacheEntry).
+//   - All operations take mu, so reads and writes are serializable: every method
+//     observes a consistent snapshot of entries/order under the lock.
+//   - TTL expiry is lazy: nothing runs in the background. An entry is purged when
+//     it is next touched (get/has/delete per key) or scanned (keys/size). clock
+//     is injectable (NewModuleWithClock) for deterministic TTL tests.
 type cacheValue struct {
 	mu         sync.Mutex
 	entries    map[string]cacheEntry
-	order      []string // insertion order, for FIFO eviction
+	order      []string // insertion order, for FIFO eviction (oldest first)
 	maxEntries int
 	defaultTTL time.Duration
 	clock      func() time.Time
@@ -180,6 +215,15 @@ func (c *cacheValue) removeOrder(key string) {
 // ttl: None or absent => use the cache default; a non-negative int => that
 // per-entry TTL in seconds (0 = no expiry); a negative int is an error
 // (symmetry with new_cache, which rejects a negative default ttl).
+//
+// value is snapshotted via serial.dumps into an immutable string before it is
+// stored, so the stored entry is independent of the caller's value. There is no
+// silent "best effort" variant: a value serial cannot encode (a function, a
+// builtin, …) makes set return a clean error rather than panicking or storing
+// nothing — the error names "serializable" so callers can detect it.
+//
+// After writing under the FIFO bound, the oldest inserted keys (order[0]…) are
+// evicted until len(order) <= maxEntries.
 func (c *cacheValue) set(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var (
 		key   string
@@ -218,11 +262,13 @@ func (c *cacheValue) set(thread *starlark.Thread, b *starlark.Builtin, args star
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A re-set of an existing key keeps its original insertion position (it is
+	// not bumped to the back), so FIFO eviction is by first-insertion age.
 	if _, exists := c.entries[key]; !exists {
 		c.order = append(c.order, key)
 	}
 	c.entries[key] = cacheEntry{data: string(data), expiresAt: expiresAt}
-	// Evict oldest entries while over the bound.
+	// FIFO eviction: while over the bound, drop the oldest-inserted key.
 	for len(c.order) > c.maxEntries {
 		oldest := c.order[0]
 		c.order = c.order[1:]
@@ -234,6 +280,12 @@ func (c *cacheValue) set(thread *starlark.Thread, b *starlark.Builtin, args star
 // get returns the value for key, or default (None) if missing or expired.
 //
 //	Cache.get(key, default=None) -> value
+//
+// A live entry is decoded with serial.loads into a fresh, independent value, so
+// mutating the returned value never touches the stored snapshot. If a stored
+// snapshot fails to decode, get returns a clean error rather than panicking.
+// Looking up a key is read-only with respect to FIFO order (get never reorders);
+// the only mutation get performs is lazily purging the key if it has expired.
 func (c *cacheValue) get(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var (
 		key string
@@ -339,9 +391,9 @@ func (c *cacheValue) keys(thread *starlark.Thread, b *starlark.Builtin, args sta
 	return starlark.NewList(out), nil
 }
 
-// size returns the number of non-expired entries. Like keys(), it purges
-// expired entries while scanning so dead entries never linger counting toward
-// max_entries.
+// size returns the number of non-expired entries. Like keys(), it lazily purges
+// expired entries while scanning (under the lock) so dead entries never linger
+// counting toward the FIFO max_entries bound.
 func (c *cacheValue) size(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	if err := starlark.UnpackArgs(b.Name(), args, kwargs); err != nil {
 		return none, err

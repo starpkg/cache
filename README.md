@@ -52,15 +52,72 @@ v.append(3)               # does not affect the cached value
 c.get("nums")             # => [1, 2]
 ```
 
-## Notes
+## Design & semantics
 
-- **Serializable values only.** Values are stored via `serial`, so functions and
-  other non-serializable values are rejected by `set` with an error.
-- **Namespacing** is per-cache: create separate caches for separate namespaces.
-- **Eviction** is FIFO (oldest insertion first) when `max_entries` is exceeded.
-- **TTL expiry is lazy:** expired entries are purged on per-key access
-  (`get`/`has`/`delete`) and when `keys()`/`size()` scan, so they never linger
-  counting toward `max_entries`.
+### 1. Eviction: FIFO, not LRU
+
+When a cache grows past `max_entries`, the **oldest-inserted** entry is evicted
+first (first-in, first-out). Re-`set`ting an existing key updates its value but
+keeps its original insertion position, so age is measured from first insertion.
+
+This is deliberately **not LRU**. FIFO needs no per-access bookkeeping — a `get`
+never reorders anything — which keeps the implementation simple and the
+behaviour predictable. The tradeoff is that a frequently read ("hot") key is not
+protected from eviction the way LRU would protect it. If you need recency-aware
+caching, that is out of scope for this module.
+
+### 2. Namespacing: independent instances
+
+Each `new_cache()` returns an **independent** cache instance. There is **no
+central manager or registry** — two caches never share entries, a bound, or a
+default TTL. To separate namespaces, create a separate cache per namespace.
+
+### 3. Value snapshotting via `serial`
+
+On `set`, the value is encoded with `serial.dumps` into an immutable string; on
+`get`, it is decoded with `serial.loads` into a **fresh** value. This makes every
+cached value a **lossless, immutable, independent copy**:
+
+```python
+v = [1, 2]
+c.set("nums", v)
+v.append(3)        # mutating the original does not touch the stored entry
+c.get("nums")      # => [1, 2]
+got = c.get("nums")
+got.append(99)     # mutating a returned copy does not touch the stored entry
+c.get("nums")      # => [1, 2]
+```
+
+Only **serializable** values can be cached. A non-serializable value (a function,
+a builtin, …) is **rejected** — there is **no silent / best-effort variant**;
+`set` returns the error.
+
+### 4. Failure handling: errors, never host panics
+
+- `set` **returns an error** (it does not panic) on a non-serializable value; the
+  message contains `"serializable"` so callers can detect it.
+- `get` **returns an error** (it does not panic) if a stored snapshot ever fails
+  to decode.
+- No operation panics the host on any path. Bad arguments surface as ordinary
+  Starlark errors.
+
+### 5. Read/write consistency
+
+Every operation is guarded by a `sync.Mutex`, so reads and writes are
+**serializable** and each call observes a consistent snapshot of the cache.
+Combined with the `serial` snapshotting above, values are isolated: a reader gets
+its own decoded copy, never a live reference into the store.
+
+### 6. Limits
+
+- `max_entries` — the FIFO bound (default `128`), host-configurable.
+- `default_ttl` — the default time-to-live in seconds (default `0` = no expiry),
+  host-configurable, and overridable per call via `set(..., ttl=)`.
+
+**TTL expiry is lazy:** expired entries are purged on per-key access
+(`get` / `has` / `delete`) and when `keys()` / `size()` scan, so they never
+linger counting toward `max_entries`. Nothing runs in the background. A Go host
+can inject a clock with `cache.NewModuleWithClock` for deterministic TTL testing.
 
 ## Configuration
 
