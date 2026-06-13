@@ -11,6 +11,7 @@ package cache
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,7 +70,7 @@ func genConfigOption[T any](name, description string, defaultValue T) *base.Conf
 	return base.NewConfigOption(defaultValue).
 		WithName(name).
 		WithDescription(description).
-		WithEnvVar("CACHE_" + upper(name))
+		WithEnvVar(strings.ToUpper(ModuleName + "_" + name))
 }
 
 // LoadModule returns the Starlark module loader.
@@ -106,18 +107,6 @@ func (m *Module) newCache(thread *starlark.Thread, b *starlark.Builtin, args sta
 		dumps:      m.dumps,
 		loads:      m.loads,
 	}, nil
-}
-
-func upper(s string) string {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		out[i] = c
-	}
-	return string(out)
 }
 
 // cacheEntry is one stored value: its serial-encoded form and optional expiry.
@@ -311,15 +300,9 @@ func (c *cacheValue) clear(thread *starlark.Thread, b *starlark.Builtin, args st
 	return none, nil
 }
 
-// keys returns the non-expired keys in insertion order.
-func (c *cacheValue) keys(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	if err := starlark.UnpackArgs(b.Name(), args, kwargs); err != nil {
-		return none, err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.clock()
-	var out []starlark.Value
+// purgeExpired drops every expired entry from both the map and the order slice,
+// returning the surviving keys in insertion order. Caller holds the lock.
+func (c *cacheValue) purgeExpired(now time.Time) []string {
 	kept := c.order[:0:0]
 	for _, k := range c.order {
 		e := c.entries[k]
@@ -328,25 +311,35 @@ func (c *cacheValue) keys(thread *starlark.Thread, b *starlark.Builtin, args sta
 			continue
 		}
 		kept = append(kept, k)
-		out = append(out, starlark.String(k))
 	}
 	c.order = kept
+	return kept
+}
+
+// keys returns the non-expired keys in insertion order.
+func (c *cacheValue) keys(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	if err := starlark.UnpackArgs(b.Name(), args, kwargs); err != nil {
+		return none, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.purgeExpired(c.clock())
+	out := make([]starlark.Value, len(kept))
+	for i, k := range kept {
+		out[i] = starlark.String(k)
+	}
 	return starlark.NewList(out), nil
 }
 
-// size returns the number of non-expired entries.
+// size returns the number of non-expired entries. Like keys(), it purges
+// expired entries while scanning so dead entries never linger counting toward
+// max_entries.
 func (c *cacheValue) size(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	if err := starlark.UnpackArgs(b.Name(), args, kwargs); err != nil {
 		return none, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.clock()
-	n := 0
-	for _, e := range c.entries {
-		if !c.expired(e, now) {
-			n++
-		}
-	}
-	return starlark.MakeInt(n), nil
+	kept := c.purgeExpired(c.clock())
+	return starlark.MakeInt(len(kept)), nil
 }

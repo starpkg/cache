@@ -58,13 +58,16 @@ c.get("nums")             # => [1, 2]
   other non-serializable values are rejected by `set` with an error.
 - **Namespacing** is per-cache: create separate caches for separate namespaces.
 - **Eviction** is FIFO (oldest insertion first) when `max_entries` is exceeded.
+- **TTL expiry is lazy:** expired entries are purged on per-key access
+  (`get`/`has`/`delete`) and when `keys()`/`size()` scan, so they never linger
+  counting toward `max_entries`.
 
 ## Configuration
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `max_entries` | `int` | `128` | Default maximum entries per cache |
-| `default_ttl` | `int` | `0` | Default TTL in seconds (`0` = no expiry) |
+| `default_ttl` | `int` | `0` | Default TTL in seconds (`0` = no expiry); seeds the `new_cache()` `ttl=` default |
 
 Settable via `CACHE_MAX_ENTRIES` / `CACHE_DEFAULT_TTL`. A Go host can inject a
 clock with `cache.NewModuleWithClock` for deterministic TTL testing.

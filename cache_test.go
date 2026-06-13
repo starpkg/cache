@@ -6,7 +6,7 @@ package cache
 //   - basic get/set/has/delete/clear/keys/size via Starlark
 //   - value independence (serial snapshot)
 //   - bounded eviction
-//   - TTL expiry with an injected clock
+//   - TTL expiry with an injected clock (incl. size() purging expired entries)
 
 import (
 	"strings"
@@ -186,5 +186,38 @@ func TestCacheTTL(t *testing.T) {
 	// And it's purged from size.
 	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
 		t.Errorf("size after expiry = %v, want 0", sz)
+	}
+}
+
+// TestCacheSizePurgesExpired asserts that size() does not count an
+// expired-but-untouched entry, and actually purges it (so it stops counting
+// toward max_entries) — consistent with keys().
+func TestCacheSizePurgesExpired(t *testing.T) {
+	now := time.Unix(1000, 0)
+	cv, thread := newCacheVal(t, func() time.Time { return now }, 16, 0)
+
+	// Two entries with a 10s ttl; never touched again via get/has.
+	for _, k := range []string{"a", "b"} {
+		if _, err := call(t, cv, thread, "set", starlark.String(k), starlark.MakeInt(1), starlark.MakeInt(10)); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 2 {
+		t.Fatalf("size before expiry = %v, want 2", sz)
+	}
+
+	// Advance past the ttl; entries are now expired but untouched.
+	now = now.Add(11 * time.Second)
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
+		t.Errorf("size after expiry = %v, want 0", sz)
+	}
+
+	// size() must have purged them outright (not merely skipped counting), so
+	// the backing maps/order no longer hold the dead entries.
+	cv.mu.Lock()
+	nEntries, nOrder := len(cv.entries), len(cv.order)
+	cv.mu.Unlock()
+	if nEntries != 0 || nOrder != 0 {
+		t.Errorf("size() left dead entries: entries=%d order=%d, want 0/0", nEntries, nOrder)
 	}
 }
