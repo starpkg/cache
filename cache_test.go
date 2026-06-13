@@ -5,12 +5,15 @@ package cache
 // Sections:
 //   - basic get/set/has/delete/clear/keys/size via Starlark
 //   - value independence (serial snapshot)
-//   - bounded eviction
+//   - bounded eviction (incl. strict FIFO — not LRU — order)
 //   - TTL expiry with an injected clock (incl. set()'s ttl=None/negative
 //     handling and size() purging expired entries)
+//   - concurrency: concurrent get/set is mutex-safe under -race
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +151,55 @@ func TestCacheEviction(t *testing.T) {
 	}
 }
 
+// TestCacheEvictionIsFIFO pins down the documented policy: eviction is FIFO
+// (oldest *inserted* first), NOT LRU. We insert a, b, c into a cache of max 2,
+// then read "a" (which under LRU would protect it), then insert "d". FIFO must
+// still evict by insertion age, so after b,c,d the survivors are c and d — "a"
+// and "b" are gone, and reading "a" did not save it.
+func TestCacheEvictionIsFIFO(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+	cv, thread := newCacheVal(t, clock, 2, 0) // max 2, no ttl
+
+	mustSet := func(k string) {
+		if _, err := call(t, cv, thread, "set", starlark.String(k), starlark.MakeInt(1)); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	mustSet("a")
+	mustSet("b") // store now: a, b
+
+	// Read "a": under LRU this would mark it most-recently-used and protect it.
+	if _, err := call(t, cv, thread, "get", starlark.String("a")); err != nil {
+		t.Fatalf("get a: %v", err)
+	}
+
+	mustSet("c") // FIFO evicts the oldest insert, "a" -> store: b, c
+	mustSet("d") // FIFO evicts "b"            -> store: c, d
+
+	present := func(k string) bool {
+		got, _ := call(t, cv, thread, "has", starlark.String(k))
+		return got == starlark.True
+	}
+	if present("a") {
+		t.Error("FIFO violated: reading 'a' protected it (that would be LRU)")
+	}
+	if present("b") {
+		t.Error("FIFO violated: 'b' should have been evicted by 'd'")
+	}
+	if !present("c") || !present("d") {
+		t.Error("FIFO violated: 'c' and 'd' (newest) should survive")
+	}
+
+	// keys() should list survivors in insertion order: c then d.
+	keys, _ := call(t, cv, thread, "keys")
+	lst := keys.(*starlark.List)
+	if lst.Len() != 2 ||
+		lst.Index(0) != starlark.String("c") ||
+		lst.Index(1) != starlark.String("d") {
+		t.Errorf("keys = %v, want [c d] in insertion order", keys)
+	}
+}
+
 func TestCacheKeysAndClear(t *testing.T) {
 	clock := func() time.Time { return time.Unix(1000, 0) }
 	cv, thread := newCacheVal(t, clock, 16, 0)
@@ -252,5 +304,72 @@ func TestCacheSizePurgesExpired(t *testing.T) {
 	cv.mu.Unlock()
 	if nEntries != 0 || nOrder != 0 {
 		t.Errorf("size() left dead entries: entries=%d order=%d, want 0/0", nEntries, nOrder)
+	}
+}
+
+// --- concurrency -------------------------------------------------------------
+
+// TestCacheConcurrentAccess hammers a single cache from many goroutines doing
+// interleaved set/get/has/size/keys/delete. It asserts no operation errors out;
+// its real purpose is to be run under `-race`, where the sync.Mutex must keep
+// the shared entries/order maps free of data races.
+func TestCacheConcurrentAccess(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+	cv, _ := newCacheVal(t, clock, 64, 0)
+
+	const goroutines = 16
+	const iters = 200
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			// Each goroutine needs its own thread; Starlark threads are not
+			// safe to share across goroutines.
+			thread := &starlark.Thread{Name: fmt.Sprintf("worker-%d", g)}
+			fail := func(err error) { errs <- err }
+			cset, _ := cv.Attr("set")
+			cget, _ := cv.Attr("get")
+			chas, _ := cv.Attr("has")
+			cdel, _ := cv.Attr("delete")
+			csize, _ := cv.Attr("size")
+			ckeys, _ := cv.Attr("keys")
+			for i := 0; i < iters; i++ {
+				key := starlark.String(fmt.Sprintf("k%d", i%8))
+				if _, err := cset.(*starlark.Builtin).CallInternal(thread, starlark.Tuple{key, starlark.MakeInt(i)}, nil); err != nil {
+					fail(err)
+					return
+				}
+				if _, err := cget.(*starlark.Builtin).CallInternal(thread, starlark.Tuple{key}, nil); err != nil {
+					fail(err)
+					return
+				}
+				if _, err := chas.(*starlark.Builtin).CallInternal(thread, starlark.Tuple{key}, nil); err != nil {
+					fail(err)
+					return
+				}
+				if _, err := csize.(*starlark.Builtin).CallInternal(thread, nil, nil); err != nil {
+					fail(err)
+					return
+				}
+				if _, err := ckeys.(*starlark.Builtin).CallInternal(thread, nil, nil); err != nil {
+					fail(err)
+					return
+				}
+				if i%5 == 0 {
+					if _, err := cdel.(*starlark.Builtin).CallInternal(thread, starlark.Tuple{key}, nil); err != nil {
+						fail(err)
+						return
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent op failed: %v", err)
 	}
 }
