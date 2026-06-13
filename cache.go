@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/1set/starlet"
+	"github.com/1set/starlet/dataconv/types"
 	"github.com/1set/starlet/lib/serial"
 	"github.com/starpkg/base"
 	"go.starlark.net/starlark"
@@ -175,18 +176,18 @@ func (c *cacheValue) removeOrder(key string) {
 // set stores value under key.
 //
 //	Cache.set(key, value, ttl=None) -> None
+//
+// ttl: None or absent => use the cache default; a non-negative int => that
+// per-entry TTL in seconds (0 = no expiry); a negative int is an error
+// (symmetry with new_cache, which rejects a negative default ttl).
 func (c *cacheValue) set(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var (
 		key   string
 		value starlark.Value
-		ttl   = starlark.MakeInt(-1) // -1 => use default
+		ttl   = types.NewNullableInt(starlark.MakeInt(-1)) // None/absent => use default
 	)
-	if err := starlark.UnpackArgs(b.Name(), args, kwargs, "key", &key, "value", &value, "ttl?", &ttl); err != nil {
+	if err := starlark.UnpackArgs(b.Name(), args, kwargs, "key", &key, "value", &value, "ttl?", ttl); err != nil {
 		return none, err
-	}
-	ttlSec, ok := ttl.Int64()
-	if !ok {
-		return none, fmt.Errorf("%s: ttl out of range", b.Name())
 	}
 
 	// Snapshot the value losslessly via serial (independent, immutable copy).
@@ -201,7 +202,14 @@ func (c *cacheValue) set(thread *starlark.Thread, b *starlark.Builtin, args star
 
 	var expiresAt time.Time
 	d := c.defaultTTL
-	if ttlSec >= 0 {
+	if !ttl.IsNull() {
+		ttlSec, ok := ttl.Value().Int64()
+		if !ok {
+			return none, fmt.Errorf("%s: ttl out of range", b.Name())
+		}
+		if ttlSec < 0 {
+			return none, fmt.Errorf("%s: ttl must not be negative", b.Name())
+		}
 		d = time.Duration(ttlSec) * time.Second
 	}
 	if d > 0 {
