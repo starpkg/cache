@@ -6,7 +6,8 @@ package cache
 //   - basic get/set/has/delete/clear/keys/size via Starlark
 //   - value independence (serial snapshot)
 //   - bounded eviction
-//   - TTL expiry with an injected clock (incl. size() purging expired entries)
+//   - TTL expiry with an injected clock (incl. set()'s ttl=None/negative
+//     handling and size() purging expired entries)
 
 import (
 	"strings"
@@ -186,6 +187,38 @@ func TestCacheTTL(t *testing.T) {
 	// And it's purged from size.
 	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
 		t.Errorf("size after expiry = %v, want 0", sz)
+	}
+}
+
+// TestCacheSetTTLArg covers the ttl argument of set(): None/absent fall back to
+// the cache default, a non-negative int overrides it, and a negative int is a
+// clean error (symmetry with new_cache).
+func TestCacheSetTTLArg(t *testing.T) {
+	now := time.Unix(1000, 0)
+	// Cache default ttl = 10s.
+	cv, thread := newCacheVal(t, func() time.Time { return now }, 16, 10)
+
+	// ttl=None must use the cache default (10s), not error.
+	if _, err := call(t, cv, thread, "set", starlark.String("d"), starlark.MakeInt(1), starlark.None); err != nil {
+		t.Fatalf("set ttl=None: %v", err)
+	}
+	// Absent ttl must also use the cache default.
+	if _, err := call(t, cv, thread, "set", starlark.String("a"), starlark.MakeInt(1)); err != nil {
+		t.Fatalf("set absent ttl: %v", err)
+	}
+	// Both visible now, both gone after the default 10s window.
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 2 {
+		t.Fatalf("size before expiry = %v, want 2", sz)
+	}
+	now = now.Add(11 * time.Second)
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
+		t.Errorf("ttl=None/absent did not use the default ttl: size = %v, want 0", sz)
+	}
+
+	// A negative explicit ttl is a clean error.
+	_, err := call(t, cv, thread, "set", starlark.String("k"), starlark.MakeInt(1), starlark.MakeInt(-1))
+	if err == nil || !strings.Contains(err.Error(), "ttl must not be negative") {
+		t.Errorf("set ttl=-1: err = %v, want a 'ttl must not be negative' error", err)
 	}
 }
 
