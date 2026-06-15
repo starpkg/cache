@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/starpkg/cache.svg)](https://pkg.go.dev/github.com/starpkg/cache)
 [![codecov](https://codecov.io/gh/starpkg/cache/graph/badge.svg)](https://codecov.io/gh/starpkg/cache)
-![binary footprint](https://img.shields.io/badge/binary_footprint-%2B0.1_MB-blue)
+![binary footprint](https://img.shields.io/badge/binary_footprint-%2B0.3_MB-blue)
 
 Bounded, in-memory key-value caches with TTL expiry for Starlark scripts.
 
