@@ -10,8 +10,9 @@ Each cache from `new_cache()` is an **independent namespace**. Stored values are
 snapshotted through the [`serial`](https://github.com/1set/starlet) module (a
 lossless `dumps`/`loads` round-trip), so a cached value is an **immutable,
 independent copy** — mutating what you put in, or what you get out, never affects
-the stored entry. Caches are **bounded**: once `max_entries` is reached, the
-oldest entry is evicted.
+the stored entry. Caches are **bounded**: a cache never holds more than
+`max_entries` live entries — once a write would exceed the bound, the
+oldest-inserted entry is evicted (FIFO).
 
 A `Cache` instance exposes the methods `set`, `get`, `has`, `delete`, `clear`,
 `keys`, and `size`.

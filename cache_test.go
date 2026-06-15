@@ -9,9 +9,19 @@ package cache
 //   - TTL expiry with an injected clock (incl. set()'s ttl=None/negative
 //     handling and size() purging expired entries)
 //   - concurrency: concurrent get/set is mutex-safe under -race
+//   - new_cache config defaulting & validation (max_entries fallback, negative
+//     ttl, out-of-range ints)
+//   - argument validation: every builtin rejects bad args with a clean Starlark
+//     error and never panics the host
+//   - serialization hardening: non-serializable values error cleanly (function,
+//     builtin, struct, non-finite float, reference cycle) and serializable
+//     values round-trip losslessly (dict/tuple/set/bytes/big int)
+//   - the starlark.Value / HasAttrs surface (String/Type/Freeze/Truth/Hash/
+//     AttrNames/Attr) of the Cache object
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +29,17 @@ import (
 
 	"github.com/1set/starlet"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkstruct"
 )
+
+// runScript runs a Starlark script with the cache module loaded (wall clock).
+func runScript(t *testing.T, script string) (map[string]interface{}, error) {
+	t.Helper()
+	m := starlet.NewDefault()
+	m.SetScriptContent([]byte(script))
+	m.SetLazyloadModules(map[string]starlet.ModuleLoader{ModuleName: NewModule().LoadModule()})
+	return m.Run()
+}
 
 // newCacheVal builds a cache value directly (with the given clock) for Go-level
 // testing of TTL/eviction without round-tripping through a script.
@@ -69,6 +89,10 @@ size_after = c.size()
 	if res["got_a"] != int64(1) {
 		t.Errorf("got_a = %v, want 1", res["got_a"])
 	}
+	if b, ok := res["got_b"].([]interface{}); !ok || len(b) != 3 ||
+		b[0] != int64(1) || b[1] != int64(2) || b[2] != int64(3) {
+		t.Errorf("got_b = %v, want [1 2 3]", res["got_b"])
+	}
 	if res["missing"] != "fallback" {
 		t.Errorf("missing = %v, want fallback", res["missing"])
 	}
@@ -105,13 +129,16 @@ got2 = c.get("k")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	// got2 must be the pristine [1, 2] (starlet returns it as a Go slice).
+	// got2 must be the pristine [1, 2] (starlet returns it as a Go slice):
+	// neither mutating the original after set nor mutating an earlier get may
+	// have leaked into the stored snapshot, so assert exact contents, not just
+	// length (a length check alone would miss an in-place element rewrite).
 	lst, ok := res["got2"].([]interface{})
 	if !ok {
 		t.Fatalf("got2 is %T, want slice", res["got2"])
 	}
-	if len(lst) != 2 {
-		t.Errorf("stored value was mutated: len = %d, want 2", len(lst))
+	if len(lst) != 2 || lst[0] != int64(1) || lst[1] != int64(2) {
+		t.Errorf("stored value was mutated: got2 = %v, want [1 2]", lst)
 	}
 }
 
@@ -307,6 +334,51 @@ func TestCacheSizePurgesExpired(t *testing.T) {
 	}
 }
 
+// TestCacheHasAndGetPurgeExpired covers the lazy per-key purge on has() and
+// get(): an entry that has expired but was never re-touched must read as absent
+// AND be physically removed from the backing store (so it stops counting toward
+// max_entries), consistent with the keys()/size() scans.
+func TestCacheHasAndGetPurgeExpired(t *testing.T) {
+	now := time.Unix(1000, 0)
+	cv, thread := newCacheVal(t, func() time.Time { return now }, 16, 0)
+
+	if _, err := call(t, cv, thread, "set", starlark.String("k"), starlark.MakeInt(1), starlark.MakeInt(10)); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// Live before expiry.
+	if got, _ := call(t, cv, thread, "has", starlark.String("k")); got != starlark.True {
+		t.Fatalf("has before expiry = %v, want True", got)
+	}
+
+	// Advance past the ttl, then probe via has() (not size()/get()).
+	now = now.Add(11 * time.Second)
+	if got, _ := call(t, cv, thread, "has", starlark.String("k")); got != starlark.False {
+		t.Errorf("has after expiry = %v, want False", got)
+	}
+	// has() must have physically purged it, not merely reported false.
+	cv.mu.Lock()
+	nEntries, nOrder := len(cv.entries), len(cv.order)
+	cv.mu.Unlock()
+	if nEntries != 0 || nOrder != 0 {
+		t.Errorf("has() left a dead entry: entries=%d order=%d, want 0/0", nEntries, nOrder)
+	}
+
+	// Same for get(): a fresh expired entry is purged on lookup.
+	if _, err := call(t, cv, thread, "set", starlark.String("g"), starlark.MakeInt(1), starlark.MakeInt(10)); err != nil {
+		t.Fatalf("set g: %v", err)
+	}
+	now = now.Add(11 * time.Second)
+	if got, _ := call(t, cv, thread, "get", starlark.String("g"), starlark.String("gone")); got != starlark.String("gone") {
+		t.Errorf("get after expiry = %v, want gone", got)
+	}
+	cv.mu.Lock()
+	nEntries, nOrder = len(cv.entries), len(cv.order)
+	cv.mu.Unlock()
+	if nEntries != 0 || nOrder != 0 {
+		t.Errorf("get() left a dead entry: entries=%d order=%d, want 0/0", nEntries, nOrder)
+	}
+}
+
 // --- concurrency -------------------------------------------------------------
 
 // TestCacheConcurrentAccess hammers a single cache from many goroutines doing
@@ -372,4 +444,296 @@ func TestCacheConcurrentAccess(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("concurrent op failed: %v", err)
 	}
+}
+
+// --- new_cache config defaulting & validation --------------------------------
+
+// TestNewCacheConfigDefaulting covers new_cache()'s own argument handling: a
+// non-positive max_entries falls back to the historical default (128), a
+// negative ttl is a clean error, and an out-of-int64-range max_entries surfaces
+// as an UnpackArgs error rather than a panic.
+func TestNewCacheConfigDefaulting(t *testing.T) {
+	mod := NewModuleWithClock(func() time.Time { return time.Unix(1000, 0) })
+	thread := &starlark.Thread{Name: "test"}
+	nc := starlark.NewBuiltin("cache.new_cache", mod.newCache)
+
+	mk := func(args ...starlark.Value) (starlark.Value, error) {
+		return nc.CallInternal(thread, starlark.Tuple(args), nil)
+	}
+
+	// No args => historical defaults (128 entries, no TTL).
+	v, err := mk()
+	if err != nil {
+		t.Fatalf("new_cache(): %v", err)
+	}
+	if cv := v.(*cacheValue); cv.maxEntries != defaultMaxEntries {
+		t.Errorf("default max_entries = %d, want %d", cv.maxEntries, defaultMaxEntries)
+	}
+
+	// A non-positive max_entries falls back to the default (not 0, not negative).
+	for _, bad := range []int64{0, -1, -100} {
+		v, err := mk(starlark.MakeInt64(bad), starlark.MakeInt(0))
+		if err != nil {
+			t.Fatalf("new_cache(max_entries=%d): %v", bad, err)
+		}
+		if cv := v.(*cacheValue); cv.maxEntries != defaultMaxEntries {
+			t.Errorf("max_entries=%d should fall back to %d, got %d", bad, defaultMaxEntries, cv.maxEntries)
+		}
+	}
+
+	// A positive max_entries is honoured.
+	if v, err := mk(starlark.MakeInt(7), starlark.MakeInt(0)); err != nil {
+		t.Fatalf("new_cache(max_entries=7): %v", err)
+	} else if cv := v.(*cacheValue); cv.maxEntries != 7 {
+		t.Errorf("max_entries=7 honoured? got %d", cv.maxEntries)
+	}
+
+	// A negative ttl is rejected with a clean error.
+	if _, err := mk(starlark.MakeInt(8), starlark.MakeInt(-1)); err == nil ||
+		!strings.Contains(err.Error(), "ttl must not be negative") {
+		t.Errorf("new_cache(ttl=-1): err = %v, want 'ttl must not be negative'", err)
+	}
+
+	// An out-of-int64-range max_entries is a clean UnpackArgs error (no panic).
+	huge := starlark.MakeBigInt(mustBig("99999999999999999999999999999"))
+	if _, err := mk(huge); err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Errorf("new_cache(huge): err = %v, want an 'out of range' error", err)
+	}
+}
+
+// TestNewCacheTTLSeedsSetDefault verifies the backward-compat wiring: the
+// default_ttl config seeds new_cache()'s ttl, which in turn becomes the default
+// for set() entries that pass ttl=None. (Config defaulting through the module.)
+func TestNewCacheTTLSeedsSetDefault(t *testing.T) {
+	now := time.Unix(1000, 0)
+	mod := NewModuleWithClock(func() time.Time { return now })
+	thread := &starlark.Thread{Name: "test"}
+	nc := starlark.NewBuiltin("cache.new_cache", mod.newCache)
+
+	// new_cache(ttl=5) => entries set without an explicit ttl expire after 5s.
+	v, err := nc.CallInternal(thread, starlark.Tuple{starlark.MakeInt(16), starlark.MakeInt(5)}, nil)
+	if err != nil {
+		t.Fatalf("new_cache: %v", err)
+	}
+	cv := v.(*cacheValue)
+	if _, err := call(t, cv, thread, "set", starlark.String("k"), starlark.MakeInt(1)); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	now = now.Add(6 * time.Second)
+	if got, _ := call(t, cv, thread, "get", starlark.String("k"), starlark.String("gone")); got != starlark.String("gone") {
+		t.Errorf("new_cache(ttl=5) did not seed set()'s default ttl: get = %v, want gone", got)
+	}
+}
+
+// --- argument validation: clean errors, never a host panic -------------------
+
+// TestArgValidation drives every builtin with malformed arguments and asserts a
+// clean Starlark error (not a panic, not a silent success). This exercises the
+// UnpackArgs error branch of each method — the first line of the "no host panic"
+// invariant.
+func TestArgValidation(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+	cv, thread := newCacheVal(t, clock, 16, 0)
+
+	tests := []struct {
+		name string
+		fn   string
+		args []starlark.Value
+		want string // substring expected in the error
+	}{
+		// Wrong arg types.
+		{"set key not string", "set", []starlark.Value{starlark.MakeInt(1), starlark.MakeInt(1)}, "set"},
+		{"get key not string", "get", []starlark.Value{starlark.MakeInt(1)}, "get"},
+		{"has key not string", "has", []starlark.Value{starlark.MakeInt(1)}, "has"},
+		{"delete key not string", "delete", []starlark.Value{starlark.MakeInt(1)}, "delete"},
+		// Missing required args.
+		{"set missing value", "set", []starlark.Value{starlark.String("k")}, "set"},
+		{"set missing all", "set", nil, "set"},
+		{"get missing key", "get", nil, "get"},
+		{"has missing key", "has", nil, "has"},
+		{"delete missing key", "delete", nil, "delete"},
+		// Too many args (no-arg methods must reject extras).
+		{"clear extra arg", "clear", []starlark.Value{starlark.MakeInt(1)}, "clear"},
+		{"keys extra arg", "keys", []starlark.Value{starlark.MakeInt(1)}, "keys"},
+		{"size extra arg", "size", []starlark.Value{starlark.MakeInt(1)}, "size"},
+		{"has extra arg", "has", []starlark.Value{starlark.String("k"), starlark.String("x")}, "has"},
+		// ttl wrong type on set (NullableInt rejects a string).
+		{"set ttl wrong type", "set", []starlark.Value{starlark.String("k"), starlark.MakeInt(1), starlark.String("nope")}, "ttl"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := call(t, cv, thread, tc.fn, tc.args...)
+			if err == nil {
+				t.Fatalf("%s(%v): expected an error, got nil", tc.fn, tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s error = %q, want substring %q", tc.fn, err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestSetTTLOutOfRange covers the reachable "ttl out of range" arm of set(): a
+// ttl int that does not fit int64 is a clean error, never a panic or overflow.
+func TestSetTTLOutOfRange(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+	cv, thread := newCacheVal(t, clock, 16, 0)
+
+	huge := starlark.MakeBigInt(mustBig("99999999999999999999999999999"))
+	_, err := call(t, cv, thread, "set", starlark.String("k"), starlark.MakeInt(1), huge)
+	if err == nil || !strings.Contains(err.Error(), "ttl out of range") {
+		t.Errorf("set(ttl=huge): err = %v, want 'ttl out of range'", err)
+	}
+	// The cache must not have stored anything on the error path.
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
+		t.Errorf("failed set should not store: size = %v, want 0", sz)
+	}
+}
+
+// --- serialization hardening: clean errors, lossless round-trip --------------
+
+// TestSetRejectsNonSerializableValues asserts that every non-serializable value
+// makes set() return a clean error whose message contains "serializable" — and
+// crucially that NONE of them panic the host (invariant 1). It probes a
+// function, a builtin, a host struct, non-finite floats, and a reference cycle.
+func TestSetRejectsNonSerializableValues(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+
+	// Script-reachable cases (function/builtin/non-finite/cycle).
+	scriptCases := map[string]string{
+		"function":  `c.set("k", lambda x: x)`,
+		"builtin":   `c.set("k", c.set)`,
+		"nan":       `c.set("k", float("nan"))`,
+		"plus_inf":  `c.set("k", float("inf"))`,
+		"minus_inf": `c.set("k", float("-inf"))`,
+		"list_cycle": `x = []
+x.append(x)
+c.set("k", x)`,
+	}
+	for name, body := range scriptCases {
+		t.Run(name, func(t *testing.T) {
+			script := "load(\"cache\", \"new_cache\")\nc = new_cache()\n" + body
+			_, err := runScript(t, script)
+			if err == nil {
+				t.Fatalf("expected an error for %s, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "serializable") {
+				t.Errorf("%s error = %q, want it to mention 'serializable'", name, err.Error())
+			}
+		})
+	}
+
+	// A host struct value (not constructible in the default dialect) — passed
+	// directly at the Go level to exercise the struct-rejection path.
+	t.Run("struct", func(t *testing.T) {
+		cv, thread := newCacheVal(t, clock, 16, 0)
+		st := starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{"a": starlark.MakeInt(1)})
+		_, err := call(t, cv, thread, "set", starlark.String("k"), st)
+		if err == nil || !strings.Contains(err.Error(), "serializable") {
+			t.Errorf("struct set: err = %v, want a 'serializable' error", err)
+		}
+		// Nothing stored on the failure path.
+		if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 0 {
+			t.Errorf("rejected struct should not store: size = %v, want 0", sz)
+		}
+	})
+}
+
+// TestRoundTripFidelity verifies invariant 2 (lossless, independent snapshots)
+// across the value shapes serial supports: a nested dict, a tuple, a set, bytes,
+// and a big int that does not fit int64. Each must come back equal in value.
+func TestRoundTripFidelity(t *testing.T) {
+	script := `
+load("cache", "new_cache")
+c = new_cache()
+c.set("dict", {"name": "Ada", "nums": [1, 2, 3], "nil": None, "f": 1.5})
+c.set("tuple", (1, "two", 3.0))
+c.set("set", set([3, 1, 2]))
+c.set("bytes", b"\x00\x01hi")
+c.set("big", 99999999999999999999999999999)
+c.set("neg_big", -99999999999999999999999999999)
+
+g_dict = c.get("dict")
+dict_ok = g_dict == {"name": "Ada", "nums": [1, 2, 3], "nil": None, "f": 1.5}
+tuple_ok = c.get("tuple") == (1, "two", 3.0)
+set_ok = c.get("set") == set([1, 2, 3])
+bytes_ok = c.get("bytes") == b"\x00\x01hi"
+big_ok = c.get("big") == 99999999999999999999999999999
+neg_big_ok = c.get("neg_big") == -99999999999999999999999999999
+`
+	res, err := runScript(t, script)
+	if err != nil {
+		t.Fatalf("round-trip script: %v", err)
+	}
+	for _, k := range []string{"dict_ok", "tuple_ok", "set_ok", "bytes_ok", "big_ok", "neg_big_ok"} {
+		if res[k] != true {
+			t.Errorf("%s = %v, want true (value did not round-trip losslessly)", k, res[k])
+		}
+	}
+}
+
+// --- the starlark.Value / HasAttrs surface of the Cache object ---------------
+
+// TestCacheValueSurface covers the small starlark.Value / HasAttrs surface of a
+// Cache object: String/Type/Truth/Freeze/Hash and AttrNames/Attr. Hash must be a
+// clean error (unhashable), Freeze must be a no-op (the store stays mutable), and
+// an unknown attribute must yield (nil, nil) per the HasAttrs contract.
+func TestCacheValueSurface(t *testing.T) {
+	clock := func() time.Time { return time.Unix(1000, 0) }
+	cv, thread := newCacheVal(t, clock, 16, 0)
+
+	if got := cv.Type(); got != "cache.Cache" {
+		t.Errorf("Type() = %q, want cache.Cache", got)
+	}
+	if got := cv.String(); got != "<cache.Cache max=16>" {
+		t.Errorf("String() = %q, want <cache.Cache max=16>", got)
+	}
+	if cv.Truth() != starlark.True {
+		t.Errorf("Truth() = %v, want True", cv.Truth())
+	}
+	if _, err := cv.Hash(); err == nil || !strings.Contains(err.Error(), "unhashable") {
+		t.Errorf("Hash() err = %v, want an 'unhashable' error", err)
+	}
+
+	want := []string{"set", "get", "has", "delete", "clear", "keys", "size"}
+	got := cv.AttrNames()
+	if len(got) != len(want) {
+		t.Fatalf("AttrNames() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("AttrNames()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Every advertised name resolves to a builtin.
+	for _, n := range want {
+		v, err := cv.Attr(n)
+		if err != nil || v == nil {
+			t.Errorf("Attr(%q) = (%v, %v), want a builtin", n, v, err)
+		}
+	}
+	// An unknown attribute is (nil, nil) per the HasAttrs contract.
+	if v, err := cv.Attr("nope"); v != nil || err != nil {
+		t.Errorf("Attr(\"nope\") = (%v, %v), want (nil, nil)", v, err)
+	}
+
+	// Freeze is a no-op: a frozen Cache must still accept writes (the stored
+	// values are immutable snapshots, so the object itself stays usable).
+	cv.Freeze()
+	if _, err := call(t, cv, thread, "set", starlark.String("k"), starlark.MakeInt(1)); err != nil {
+		t.Errorf("set after Freeze: %v", err)
+	}
+	if sz, _ := call(t, cv, thread, "size"); sz.(starlark.Int).BigInt().Int64() != 1 {
+		t.Errorf("size after Freeze+set = %v, want 1", sz)
+	}
+}
+
+// mustBig parses a base-10 big.Int for tests, failing the build path loudly on a
+// bad literal.
+func mustBig(s string) *big.Int {
+	bi, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		panic("mustBig: invalid literal " + s)
+	}
+	return bi
 }
