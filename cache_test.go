@@ -89,6 +89,10 @@ size_after = c.size()
 	if res["got_a"] != int64(1) {
 		t.Errorf("got_a = %v, want 1", res["got_a"])
 	}
+	if b, ok := res["got_b"].([]interface{}); !ok || len(b) != 3 ||
+		b[0] != int64(1) || b[1] != int64(2) || b[2] != int64(3) {
+		t.Errorf("got_b = %v, want [1 2 3]", res["got_b"])
+	}
 	if res["missing"] != "fallback" {
 		t.Errorf("missing = %v, want fallback", res["missing"])
 	}
@@ -125,13 +129,16 @@ got2 = c.get("k")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	// got2 must be the pristine [1, 2] (starlet returns it as a Go slice).
+	// got2 must be the pristine [1, 2] (starlet returns it as a Go slice):
+	// neither mutating the original after set nor mutating an earlier get may
+	// have leaked into the stored snapshot, so assert exact contents, not just
+	// length (a length check alone would miss an in-place element rewrite).
 	lst, ok := res["got2"].([]interface{})
 	if !ok {
 		t.Fatalf("got2 is %T, want slice", res["got2"])
 	}
-	if len(lst) != 2 {
-		t.Errorf("stored value was mutated: len = %d, want 2", len(lst))
+	if len(lst) != 2 || lst[0] != int64(1) || lst[1] != int64(2) {
+		t.Errorf("stored value was mutated: got2 = %v, want [1 2]", lst)
 	}
 }
 
