@@ -64,6 +64,7 @@ Group by functional goal — **do not add one `*_test.go` per fix.** `cache_test
 ## Documentation
 
 Three layers must stay in sync (enforced by the doc standard, `plan/starpkg文档标准（DOC-STD）`):
+
 - **`README.md`** — every script-facing builtin and method (`new_cache`, and `set`/`get`/`has`/`delete`/`clear`/`keys`/`size`) documented as a backtick whole-word; host levers (`max_entries`, `default_ttl`, env vars, `NewModuleWithClock`) under *Design & semantics* / *Configuration*. Names and signatures must match the code.
 - **GoDoc** — package comment + a doc comment whose first word is the symbol name on every exported symbol (`ModuleName`, `Module`, `NewModule`, `NewModuleWithClock`, `(*Module).LoadModule`), gated by `revive`'s `exported` rule in CI.
 - **The doccov gate** — `go run github.com/1set/meta/doccov@master .` must exit 0; it statically scans `starlark.NewBuiltin("…", …)` calls and fails if any name is not a backtick word in the README. Methods are registered under static literal names in `Attr` precisely so this scanner can see them. Wired into CI via the reusable workflow's `doc-coverage: true`.
