@@ -11,6 +11,9 @@ independent copy** — mutating what you put in, or what you get out, never affe
 the stored entry. Caches are **bounded**: once `max_entries` is reached, the
 oldest entry is evicted.
 
+A `Cache` instance exposes the methods `set`, `get`, `has`, `delete`, `clear`,
+`keys`, and `size`.
+
 ## Installation
 
 ```bash

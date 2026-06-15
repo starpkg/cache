@@ -179,19 +179,26 @@ func (c *cacheValue) AttrNames() []string {
 }
 
 func (c *cacheValue) Attr(name string) (starlark.Value, error) {
-	fn, ok := map[string]func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error){
-		"set":    c.set,
-		"get":    c.get,
-		"has":    c.has,
-		"delete": c.delete,
-		"clear":  c.clear,
-		"keys":   c.keys,
-		"size":   c.size,
-	}[name]
-	if !ok {
-		return nil, nil
+	// Each method is registered under a static literal name so the static
+	// doc-coverage scanner (1set/meta/doccov) can see the script-facing
+	// surface; the name string is otherwise only used in error messages.
+	switch name {
+	case "set":
+		return starlark.NewBuiltin("set", c.set), nil
+	case "get":
+		return starlark.NewBuiltin("get", c.get), nil
+	case "has":
+		return starlark.NewBuiltin("has", c.has), nil
+	case "delete":
+		return starlark.NewBuiltin("delete", c.delete), nil
+	case "clear":
+		return starlark.NewBuiltin("clear", c.clear), nil
+	case "keys":
+		return starlark.NewBuiltin("keys", c.keys), nil
+	case "size":
+		return starlark.NewBuiltin("size", c.size), nil
 	}
-	return starlark.NewBuiltin("cache.Cache."+name, fn), nil
+	return nil, nil
 }
 
 // expired reports whether e is expired as of now. Caller holds the lock.
