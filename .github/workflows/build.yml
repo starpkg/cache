@@ -18,7 +18,7 @@ jobs:
     with:
       go-floor: "1.19"
       doc-coverage: true
-      cov-min: 81
+      cov-min: 96
       footprint: true
       footprint-max-mb: 3
     secrets: inherit
