@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`starpkg/cache` is an **L4 domain module** of the Star\* ecosystem: it exposes bounded, in-memory key-value caches with TTL expiry to Starlark scripts. A script loads the module, calls `new_cache()` to get an independent cache instance, then `set`/`get`/`has`/`delete`/`clear`/`keys`/`size` against it.
+`starpkg/cache` is an **L3 domain module** of the Star\* ecosystem: it exposes bounded, in-memory key-value caches with TTL expiry to Starlark scripts. A script loads the module, calls `new_cache()` to get an independent cache instance, then `set`/`get`/`has`/`delete`/`clear`/`keys`/`size` against it.
 
 Where it sits in the starpkg positioning — *"support for necessary LOCAL operations + simple abstractions over common ONLINE services"* — `cache` is squarely a **local capability**: an in-process, in-memory store. There is no network, no external service, no persistence. It is the local-operations side of starpkg, the same family as a process-local scratchpad, not a wrapper over a remote cache (no Redis/Memcached client here).
 
@@ -71,6 +71,6 @@ Three layers must stay in sync (enforced by the doc standard, `plan/starpkg文�
 
 ## Release discipline
 
-- **Floor = go 1.19** (this repo's go.mod), pinned to the ecosystem baseline `go.starlark.net` (`ffb3f39`) + `1set/starlet v0.2.1` + `starpkg/base v0.1.0`. The floor only rises in this repo's own pin-upgrade PR.
-- **CI matrix** = `[1.19.x, 1.25.x]` via the centralized reusable workflow in `1set/meta` (`go-ci.yml`), pinned to a commit SHA, with `doc-coverage: true`.
+- **Floor = go 1.19** (this repo's go.mod), pinned to the ecosystem baseline `go.starlark.net` (`ffb3f39`) + `1set/starlet v0.2.5` + `starpkg/base v0.1.4`. The floor only rises in this repo's own pin-upgrade PR.
+- **CI matrix** = `[1.19.x, 1.27.x]` via the centralized reusable workflow in `1set/meta` (`go-ci.yml`), pinned to a commit SHA, with `doc-coverage: true`.
 - **Bumping the version, the go floor, or tagging are user-confirmed actions** — never tag autonomously; the pin-upgrade PR is the last of a repo's series and must merge before any tag; default to patch bumps; published tags are immutable in the Go module proxy.
